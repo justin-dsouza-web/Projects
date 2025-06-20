@@ -1,0 +1,531 @@
+import { useState, useRef, useCallback } from "react";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Camera, X, RotateCcw, Plus } from "lucide-react";
+import { useMutation } from "@tanstack/react-query";
+import { apiRequest } from "@/lib/queryClient";
+import { useToast } from "@/hooks/use-toast";
+import { isUnauthorizedError } from "@/lib/authUtils";
+
+interface CameraModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onFoodAnalyzed: (result: any) => void;
+}
+
+export default function CameraModal({ isOpen, onClose, onFoodAnalyzed }: CameraModalProps) {
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [hasPermission, setHasPermission] = useState<boolean | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { toast } = useToast();
+
+  const analysisMutation = useMutation({
+    mutationFn: async (imageData: string) => {
+      console.log('Sending image to API, size:', imageData.length);
+      const response = await apiRequest("POST", "/api/food/analyze", {
+        image: imageData
+      });
+      console.log('API response received:', response);
+      return response;
+    },
+    onSuccess: (result) => {
+      console.log('Analysis successful:', result);
+      onFoodAnalyzed(result);
+    },
+    onError: (error: any) => {
+      console.error('Analysis error:', error);
+      if (isUnauthorizedError(error)) {
+        toast({
+          title: "Unauthorized",
+          description: "You are logged out. Logging in again...",
+          variant: "destructive",
+        });
+        setTimeout(() => {
+          window.location.href = "/api/login";
+        }, 500);
+        return;
+      }
+      
+      let errorMessage = "Failed to analyze food image. Please try again.";
+      let showFallback = false;
+      
+      if (error.message?.includes('503') || error.message?.includes('temporarily unavailable')) {
+        errorMessage = "AI analysis temporarily unavailable. Try manual food entry instead.";
+        showFallback = true;
+      } else if (error.message?.includes('413') || error.message?.includes('large')) {
+        errorMessage = "Image is too large. Please try a smaller photo.";
+      } else if (error.message?.includes('400')) {
+        errorMessage = "Could not identify food in the image. Please try a clearer photo with good lighting.";
+      }
+      
+      toast({
+        title: "Analysis Failed",
+        description: errorMessage,
+        variant: "destructive",
+        action: showFallback ? (
+          <Button variant="outline" size="sm" onClick={() => {
+            onClose();
+            // Signal to parent to open manual entry
+            setTimeout(() => {
+              const manualButton = document.querySelector('[data-manual-entry]') as HTMLButtonElement;
+              manualButton?.click();
+            }, 100);
+          }}>
+            Manual Entry
+          </Button>
+        ) : undefined,
+      });
+    },
+  });
+
+  const startCamera = useCallback(async () => {
+    try {
+      setHasPermission(null);
+      
+      // Check browser support
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera not supported in this browser');
+      }
+
+      // Try different constraint options
+      let mediaStream;
+      
+      try {
+        // First try with rear camera preference
+        const constraints: MediaStreamConstraints = {
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        };
+        mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (envError) {
+        console.log('Environment camera failed, trying default:', envError);
+        // Fallback to any available camera
+        mediaStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      }
+      
+      setStream(mediaStream);
+      setHasPermission(true);
+      
+      // Set up video element
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+        
+        // Multiple attempts to start video playback
+        const startVideo = async () => {
+          if (videoRef.current) {
+            try {
+              await videoRef.current.play();
+              console.log('Video started successfully');
+            } catch (error) {
+              console.error('Video play error:', error);
+              // Try again after a short delay
+              setTimeout(() => {
+                if (videoRef.current) {
+                  videoRef.current.play().catch(console.error);
+                }
+              }, 500);
+            }
+          }
+        };
+
+        videoRef.current.onloadedmetadata = startVideo;
+        videoRef.current.oncanplay = startVideo;
+        
+        // Also try immediately
+        setTimeout(startVideo, 100);
+      }
+      
+      toast({
+        title: "Camera Ready",
+        description: "Camera access granted! You can now take photos.",
+      });
+      
+    } catch (error: any) {
+      console.error('Camera error:', error);
+      setHasPermission(false);
+      
+      let errorMessage = "Camera access denied or unavailable.";
+      let errorTitle = "Camera Error";
+      
+      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+        errorTitle = "Permission Denied";
+        errorMessage = "Camera access was denied. Please allow camera permissions and try again.";
+      } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+        errorTitle = "No Camera Found";
+        errorMessage = "No camera device found. Please connect a camera or use photo upload.";
+      } else if (error.name === 'NotSupportedError' || error.name === 'NotSupportedError') {
+        errorTitle = "Not Supported";
+        errorMessage = "Camera not supported in this browser. Please use photo upload.";
+      } else if (error.name === 'OverconstrainedError') {
+        errorMessage = "Camera constraints not supported. Trying basic camera access.";
+      }
+      
+      toast({
+        title: errorTitle,
+        description: errorMessage,
+        variant: "destructive",
+      });
+    }
+  }, [toast]);
+
+  const stopCamera = useCallback(() => {
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      setStream(null);
+    }
+  }, [stream]);
+
+  const capturePhoto = useCallback(() => {
+    if (!videoRef.current || !canvasRef.current) return;
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+
+    if (!ctx) return;
+
+    // Set canvas size to video dimensions
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    
+    // Draw the video frame to canvas
+    ctx.drawImage(video, 0, 0);
+
+    // Convert to JPEG with reasonable quality and size
+    const imageData = canvas.toDataURL('image/jpeg', 0.7);
+    setCapturedImage(imageData);
+    stopCamera();
+  }, [stopCamera]);
+
+  const handleFileUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    // Check file type
+    if (!file.type.startsWith('image/')) {
+      toast({
+        title: "Invalid File",
+        description: "Please select an image file.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Check file size (limit to 10MB)
+    if (file.size > 10 * 1024 * 1024) {
+      toast({
+        title: "File Too Large",
+        description: "Please select an image smaller than 10MB.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const imageData = e.target?.result as string;
+      if (imageData) {
+        try {
+          const compressedImage = await compressImage(imageData);
+          setCapturedImage(compressedImage);
+          stopCamera();
+          
+          toast({
+            title: "Photo Uploaded",
+            description: "Photo uploaded successfully. Click 'Analyze Food' to scan.",
+          });
+        } catch (error) {
+          console.error('Image processing error:', error);
+          toast({
+            title: "Processing Error",
+            description: "Failed to process the image. Please try a different photo.",
+            variant: "destructive",
+          });
+        }
+      }
+    };
+    reader.onerror = () => {
+      toast({
+        title: "Error",
+        description: "Failed to read the image file.",
+        variant: "destructive",
+      });
+    };
+    reader.readAsDataURL(file);
+    
+    // Clear the input value to allow same file to be selected again
+    event.target.value = '';
+  }, [stopCamera, toast]);
+
+  const retakePhoto = useCallback(() => {
+    setCapturedImage(null);
+    startCamera();
+  }, [startCamera]);
+
+  // Helper function to compress image
+  const compressImage = useCallback((imageData: string, quality: number = 0.6): Promise<string> => {
+    return new Promise((resolve) => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      
+      img.onload = () => {
+        // Calculate new dimensions (max 800px on longest side)
+        const maxSize = 800;
+        let { width, height } = img;
+        
+        if (width > height && width > maxSize) {
+          height = (height * maxSize) / width;
+          width = maxSize;
+        } else if (height > maxSize) {
+          width = (width * maxSize) / height;
+          height = maxSize;
+        }
+        
+        canvas.width = width;
+        canvas.height = height;
+        
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', quality));
+        } else {
+          resolve(imageData);
+        }
+      };
+      
+      img.src = imageData;
+    });
+  }, []);
+
+  const analyzeImage = useCallback(async () => {
+    if (capturedImage) {
+      try {
+        console.log('Starting image analysis...');
+        const compressedImage = await compressImage(capturedImage);
+        console.log('Image compressed, sending to API...');
+        analysisMutation.mutate(compressedImage);
+      } catch (error) {
+        console.error('Image analysis error:', error);
+        toast({
+          title: "Analysis Error",
+          description: "Failed to process image. Please try again.",
+          variant: "destructive",
+        });
+      }
+    }
+  }, [capturedImage, analysisMutation, compressImage, toast]);
+
+  const handleClose = useCallback(() => {
+    stopCamera();
+    setCapturedImage(null);
+    setHasPermission(null);
+    onClose();
+  }, [stopCamera, onClose]);
+
+  // Start camera when modal opens
+  const handleModalOpenChange = useCallback((open: boolean) => {
+    if (open && !stream && !capturedImage) {
+      // Don't auto-start camera, let user click the button
+      setHasPermission(null);
+    } else if (!open) {
+      handleClose();
+    }
+  }, [stream, capturedImage, handleClose]);
+
+  return (
+    <Dialog open={isOpen} onOpenChange={handleModalOpenChange}>
+      <DialogContent className="max-w-md" aria-describedby="camera-description">
+        <DialogHeader>
+          <DialogTitle className="flex items-center justify-between">
+            Scan Your Food
+            <Button variant="ghost" size="sm" onClick={handleClose}>
+              <X className="w-4 h-4" />
+            </Button>
+          </DialogTitle>
+        </DialogHeader>
+        
+        <div id="camera-description" className="sr-only">
+          Use your camera to scan food items for automatic nutrition analysis
+        </div>
+
+        <div className="space-y-4">
+          {/* Camera Preview or Captured Image */}
+          <div className="relative bg-gray-900 aspect-square rounded-lg overflow-hidden">
+            {capturedImage ? (
+              <img
+                src={capturedImage}
+                alt="Captured food"
+                className="w-full h-full object-cover"
+              />
+            ) : hasPermission && stream ? (
+              <>
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full h-full object-cover"
+                  onLoadedMetadata={() => {
+                    if (videoRef.current) {
+                      videoRef.current.play().catch(console.error);
+                    }
+                  }}
+                />
+                <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2">
+                  <p className="text-white text-sm bg-black/50 px-3 py-1 rounded-full">
+                    Position food in frame and tap capture
+                  </p>
+                </div>
+              </>
+            ) : hasPermission === false ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center text-white text-center p-6">
+                <div className="w-20 h-20 bg-red-500/20 rounded-full flex items-center justify-center mb-6">
+                  <Camera className="w-10 h-10 text-red-300" />
+                </div>
+                <p className="text-xl font-bold mb-3">Camera Access Needed</p>
+                <p className="text-sm opacity-90 mb-6 leading-relaxed">
+                  To scan food images, please allow camera access when prompted by your browser. 
+                  Look for a camera icon in your address bar or browser notifications.
+                </p>
+                <div className="space-y-3 w-full">
+                  <Button onClick={startCamera} variant="secondary" className="w-full bg-white/20 hover:bg-white/30 border-white/30">
+                    Request Camera Access
+                  </Button>
+                  <div className="text-center">
+                    <span className="text-sm opacity-75">or</span>
+                  </div>
+                  <Button
+                    onClick={() => fileInputRef.current?.click()}
+                    variant="outline"
+                    className="w-full bg-white/10 hover:bg-white/20 border-white/30"
+                  >
+                    Upload Photo Instead
+                  </Button>
+                </div>
+              </div>
+            ) : hasPermission === null ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center text-white text-center p-6">
+                <div className="w-20 h-20 bg-primary-500/20 rounded-full flex items-center justify-center mb-6">
+                  <Camera className="w-10 h-10 text-primary-300" />
+                </div>
+                <p className="text-xl font-bold mb-3">Ready to Scan Food</p>
+                <p className="text-sm opacity-90 mb-6 leading-relaxed">
+                  Click the button below to access your camera and scan food items for instant nutrition analysis.
+                </p>
+                <div className="space-y-3 w-full">
+                  <Button 
+                    onClick={startCamera} 
+                    className="w-full bg-primary-500 hover:bg-primary-600 text-white font-medium py-3 rounded-xl shadow-lg transition-all duration-300"
+                  >
+                    <Camera className="w-5 h-5 mr-2" />
+                    Start Camera
+                  </Button>
+                  <div className="text-center">
+                    <span className="text-sm opacity-75">or</span>
+                  </div>
+                  <Button
+                    onClick={() => fileInputRef.current?.click()}
+                    variant="outline"
+                    className="w-full bg-white/10 hover:bg-white/20 border-white/30 text-white font-medium py-3 rounded-xl"
+                  >
+                    <Plus className="w-5 h-5 mr-2" />
+                    Upload Photo
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="absolute inset-0 flex items-center justify-center text-white">
+                <div className="text-center">
+                  <div className="w-16 h-16 border-4 border-white/30 border-t-white rounded-full animate-spin mx-auto mb-4"></div>
+                  <p className="text-lg font-medium">Connecting to Camera...</p>
+                  <p className="text-sm opacity-75 mt-2">Please allow access when prompted</p>
+                </div>
+              </div>
+            )}
+
+            {/* Scanning Overlay */}
+            {hasPermission && stream && !capturedImage && (
+              <div className="absolute inset-4 border-2 border-white opacity-50 rounded-lg">
+                <div className="absolute top-0 left-0 w-8 h-8 border-l-4 border-t-4 border-white"></div>
+                <div className="absolute top-0 right-0 w-8 h-8 border-r-4 border-t-4 border-white"></div>
+                <div className="absolute bottom-0 left-0 w-8 h-8 border-l-4 border-b-4 border-white"></div>
+                <div className="absolute bottom-0 right-0 w-8 h-8 border-r-4 border-b-4 border-white"></div>
+              </div>
+            )}
+          </div>
+
+          {/* Action Buttons */}
+          <div className="space-y-3">
+            {capturedImage ? (
+              <div className="flex space-x-3">
+                <Button
+                  onClick={retakePhoto}
+                  variant="outline"
+                  className="flex-1 flex items-center space-x-2"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  <span>Retake</span>
+                </Button>
+                <Button
+                  onClick={analyzeImage}
+                  disabled={analysisMutation.isPending}
+                  className="flex-1 bg-primary-500 hover:bg-primary-600"
+                >
+                  {analysisMutation.isPending ? "Analyzing..." : "Analyze"}
+                </Button>
+              </div>
+            ) : hasPermission && stream ? (
+              <Button
+                onClick={capturePhoto}
+                className="w-full bg-primary-500 hover:bg-primary-600"
+              >
+                Capture Photo
+              </Button>
+            ) : (
+              <div className="space-y-2">
+                <Button
+                  onClick={startCamera}
+                  className="w-full bg-primary-500 hover:bg-primary-600"
+                >
+                  Enable Camera
+                </Button>
+                <div className="text-center">
+                  <span className="text-sm text-gray-500">or</span>
+                </div>
+                <Button
+                  onClick={() => fileInputRef.current?.click()}
+                  variant="outline"
+                  className="w-full"
+                >
+                  Upload Photo
+                </Button>
+              </div>
+            )}
+          </div>
+
+          <p className="text-sm text-gray-600 text-center">
+            Take a clear photo of your food for accurate nutrition analysis
+          </p>
+        </div>
+
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          onChange={handleFileUpload}
+          className="hidden"
+        />
+
+        {/* Hidden canvas for image capture */}
+        <canvas ref={canvasRef} className="hidden" />
+      </DialogContent>
+    </Dialog>
+  );
+}
