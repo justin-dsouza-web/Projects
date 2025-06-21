@@ -1,0 +1,57 @@
+// ... existing imports ...
+
+export default function CameraModal({ isOpen, onClose, onFoodAnalyzed }: CameraModalProps) {
+  // ... existing state declarations ...
+
+  // New useEffect for automatic camera initialization
+  useEffect(() => {
+    if (isOpen && !capturedImage && !stream && hasPermission === null) {
+      startCamera();
+    }
+    
+    // Cleanup on unmount
+    return () => {
+      if (stream) {
+        stopCamera();
+      }
+    };
+  }, [isOpen, capturedImage, stream, hasPermission, startCamera, stopCamera]);
+
+  // ... existing useMutation, callbacks, and helper functions ...
+
+  // Updated startCamera with simplified video setup
+  const startCamera = useCallback(async () => {
+    try {
+      setHasPermission(null);
+      
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera not supported');
+      }
+
+      // ... existing camera constraint logic ...
+
+      setStream(mediaStream);
+      setHasPermission(true);
+      
+      // Simplified video setup
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+        videoRef.current.play().catch(console.error);
+      }
+    } catch (error: any) {
+      // ... existing error handling ...
+    }
+  }, [toast]);
+
+  // ... existing stopCamera, capturePhoto, etc ...
+
+  // Removed handleModalOpenChange callback
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => !open && handleClose()}>
+      <DialogContent className="max-w-md" aria-describedby="camera-description">
+        {/* ... existing dialog content ... */}
+      </DialogContent>
+    </Dialog>
+  );
+}
